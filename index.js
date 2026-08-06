@@ -11389,7 +11389,21 @@ class OPNsenseMCPServer {
     // Extract params, excluding the method field
     const { method: _, params = {}, ...otherArgs } = args;
     const callParams = { ...params, ...otherArgs };
-    
+
+    // Generated client methods take positional args (uuid, data, config),
+    // but the tool schema only gives us one flat object here. Pull 'uuid'
+    // out as the leading positional arg when the method expects it (matches
+    // the uuid?/uuid: string first-param pattern used throughout the
+    // generated client, e.g. clientDelClient/clientSetClient/serverSetServer).
+    // The rest of callParams becomes the data arg.
+    if ('uuid' in callParams) {
+      const { uuid, ...rest } = callParams;
+      if (Object.keys(rest).length > 0) {
+        return await method.call(moduleObj, uuid, rest);
+      }
+      return await method.call(moduleObj, uuid);
+    }
+
     // Only pass parameters if there are any
     if (Object.keys(callParams).length > 0) {
       return await method.call(moduleObj, callParams);
