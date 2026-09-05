@@ -8,6 +8,32 @@ import {
   McpError,
 } from '@modelcontextprotocol/sdk/types.js';
 import { OPNsenseClient } from '@richard-stovall/opnsense-typescript-client';
+import { readFileSync } from 'fs';
+import { fileURLToPath } from 'url';
+import { dirname, join } from 'path';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+// Per-methode positionele-parameternamen ("<module>.<method>" -> ["uuid","data","config"]),
+// gegenereerd uit de client-fork's TS-signatures door generate-call-signatures.js.
+// Draai dat script opnieuw na elke update van de client-fork, anders raakt deze
+// tabel uit sync met de daadwerkelijke methode-signatures.
+const CALL_SIGNATURES = JSON.parse(readFileSync(join(__dirname, 'call-signatures.json'), 'utf8'));
+
+// Failing tool calls log their raw args to stderr for debugging — but those
+// args can carry credentials (wireguard private keys, user passwords, API
+// keys). Redact known-sensitive field names before logging.
+const SECRET_FIELD_RE = /password|secret|privatekey|apikey|token/i;
+function redactSecrets(value) {
+  if (Array.isArray(value)) return value.map(redactSecrets);
+  if (value && typeof value === 'object') {
+    const out = {};
+    for (const [k, v] of Object.entries(value)) {
+      out[k] = SECRET_FIELD_RE.test(k) ? '[redacted]' : redactSecrets(v);
+    }
+    return out;
+  }
+  return value;
+}
 
 // Embedded modular tool definitions
 const TOOLS = [
@@ -11312,7 +11338,7 @@ class OPNsenseMCPServer {
         console.error('Tool call error:', {
           tool: tool.name,
           module: tool.module,
-          args,
+          args: redactSecrets(args),
           error: error instanceof Error ? error.message : 'Unknown error',
           stack: error instanceof Error ? error.stack : undefined
         });
@@ -11384,27 +11410,54 @@ class OPNsenseMCPServer {
     }
 
     // Call the method with params (if provided)
-    console.error(`Calling ${tool.module}.${args.method} with params:`, args.params);
-    
+    console.error(`Calling ${tool.module}.${args.method}`);
+
     // Extract params, excluding the method field
     const { method: _, params = {}, ...otherArgs } = args;
     const callParams = { ...params, ...otherArgs };
 
-    // Generated client methods take positional args (uuid, data, config),
-    // but the tool schema only gives us one flat object here. Pull 'uuid'
-    // out as the leading positional arg when the method expects it (matches
-    // the uuid?/uuid: string first-param pattern used throughout the
-    // generated client, e.g. clientDelClient/clientSetClient/serverSetServer).
-    // The rest of callParams becomes the data arg.
-    if ('uuid' in callParams) {
-      const { uuid, ...rest } = callParams;
-      if (Object.keys(rest).length > 0) {
-        return await method.call(moduleObj, uuid, rest);
+    // Generated client methods take positional args in a per-method order
+    // (e.g. (uuid, data, config), (data, config), (nodeType, uuid, config),
+    // (uuid, enabled, data, config), ...) — a single hardcoded 'uuid'
+    // heuristic can't cover this; a repo-wide scan found 10+ distinct
+    // call shapes (see project_glinet_wireguard.md, review 5 sep 2026).
+    // Look up the real parameter order generated from the client-fork's own
+    // TS signatures (generate-call-signatures.js) instead of guessing.
+    const sigKey = tool.module === 'plugins'
+      ? `plugins.${tool.submodule}.${args.method}`
+      : `${tool.module}.${args.method}`;
+    const paramNames = CALL_SIGNATURES[sigKey];
+
+    if (paramNames) {
+      const named = new Set(paramNames.filter((n) => n !== 'data' && n !== 'config'));
+      // An empty-string id-like arg (uuid/id/sid/...) builds a malformed,
+      // silently-wrong URL (trailing slash / empty segment) instead of
+      // failing loudly — reject it up front.
+      for (const name of named) {
+        if (callParams[name] === '') {
+          throw new Error(`Parameter '${name}' cannot be an empty string`);
+        }
       }
-      return await method.call(moduleObj, uuid);
+      const positional = [];
+      const leftover = {};
+      for (const [k, v] of Object.entries(callParams)) {
+        if (named.has(k)) continue; // pulled out below, in signature order
+        leftover[k] = v;
+      }
+      for (const name of paramNames) {
+        if (name === 'config') break; // never guess a config object from flat params
+        if (name === 'data') {
+          if (Object.keys(leftover).length > 0) positional.push(leftover);
+          break;
+        }
+        positional.push(callParams[name]);
+      }
+      return await method.call(moduleObj, ...positional);
     }
 
-    // Only pass parameters if there are any
+    // Fallback for any method not found in call-signatures.json (should not
+    // happen once the table is generated from the same client version that's
+    // installed, but fails safe rather than silently misrouting the call).
     if (Object.keys(callParams).length > 0) {
       return await method.call(moduleObj, callParams);
     } else {
